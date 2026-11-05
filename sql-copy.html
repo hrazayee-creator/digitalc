@@ -1,0 +1,368 @@
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>کپی SQL</title><style>
+body{font-family:system-ui,Tahoma,sans-serif;margin:0;background:#f4f6fa;color:#1b2433;padding:16px}
+h2{margin:22px 0 6px} p{color:#6b7588;line-height:1.8;font-size:14px}
+textarea{width:100%;height:180px;direction:ltr;font-family:monospace;font-size:12px;border:1px solid #cdd5e3;border-radius:10px;padding:10px;box-sizing:border-box}
+button{background:#17243a;color:#fff;border:0;border-radius:12px;padding:14px 18px;font-size:16px;font-weight:700;width:100%;margin-top:8px}
+.ok{background:#13734d}
+</style></head><body>
+<h2>۱) راه‌اندازی دیتابیس (setup.sql)</h2>
+<p>روی دکمه بزن، بعد در Supabase بخش SQL Editor یک Query جدید باز کن، Paste کن و Run بزن.</p>
+<textarea id="a" readonly>-- ============================================================================
+-- Digital card panel - database setup (run ONCE in Supabase: SQL Editor -&gt; New query -&gt; Run)
+-- Security model: tables are locked (no direct access for anon/authenticated).
+-- Everything goes through the functions below.
+--   * visitors:  get_card(slug)            -&gt; only ACTIVE, non-expired cards
+--   * customers: edit_load/edit_save(key)  -&gt; secret edit key (stored only as a SHA-256 hash)
+--   * you:       admin_* functions         -&gt; only users listed in public.admins
+-- ============================================================================
+
+create table if not exists public.admins (
+  user_id uuid primary key
+);
+
+create table if not exists public.cards (
+  id          uuid primary key default gen_random_uuid(),
+  slug        text not null unique,
+  key_hash    text not null unique,
+  label       text not null default &#x27;&#x27;,
+  data        jsonb not null default &#x27;{}&#x27;::jsonb,
+  active      boolean not null default false,
+  expires_at  timestamptz,
+  views       bigint not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  constraint cards_slug_format check (slug ~ &#x27;^[a-z0-9][a-z0-9-]{2,29}$&#x27;)
+);
+
+alter table public.cards  enable row level security;
+alter table public.admins enable row level security;
+revoke all on table public.cards  from anon, authenticated;
+revoke all on table public.admins from anon, authenticated;
+
+-- ---------------------------------------------------------------- helpers
+create or replace function public._hash_key(p_key text)
+returns text
+language sql
+immutable
+set search_path = public
+as $$
+  select encode(sha256(convert_to(coalesce(p_key, &#x27;&#x27;), &#x27;utf8&#x27;)), &#x27;hex&#x27;);
+$$;
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (select 1 from public.admins a where a.user_id = auth.uid());
+$$;
+
+-- ---------------------------------------------------------------- visitors
+create or replace function public.get_card(p_slug text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  r public.cards%rowtype;
+begin
+  select * into r
+  from public.cards c
+  where c.slug = lower(btrim(p_slug))
+    and c.active
+    and (c.expires_at is null or c.expires_at &gt; now());
+  if not found then
+    return null;
+  end if;
+  update public.cards set views = views + 1 where id = r.id;
+  return r.data;
+end;
+$$;
+
+-- ---------------------------------------------------------------- customers
+create or replace function public.edit_load(p_key text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  r public.cards%rowtype;
+begin
+  select * into r from public.cards c where c.key_hash = public._hash_key(p_key);
+  if not found then
+    return null;
+  end if;
+  return jsonb_build_object(
+    &#x27;slug&#x27;, r.slug,
+    &#x27;label&#x27;, r.label,
+    &#x27;data&#x27;, r.data,
+    &#x27;active&#x27;, r.active,
+    &#x27;expires_at&#x27;, r.expires_at
+  );
+end;
+$$;
+
+create or replace function public.edit_save(p_key text, p_data jsonb)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  n integer;
+begin
+  if p_data is null or jsonb_typeof(p_data) is distinct from &#x27;object&#x27; then
+    raise exception &#x27;bad data&#x27; using errcode = &#x27;22023&#x27;;
+  end if;
+  if length(p_data::text) &gt; 70000 then
+    raise exception &#x27;data too large&#x27; using errcode = &#x27;22023&#x27;;
+  end if;
+  update public.cards c
+     set data = p_data, updated_at = now()
+   where c.key_hash = public._hash_key(p_key);
+  get diagnostics n = row_count;
+  return n = 1;
+end;
+$$;
+
+-- ---------------------------------------------------------------- admin
+create or replace function public.admin_create(p_label text default &#x27;&#x27;, p_slug text default null, p_days integer default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_slug text;
+  v_key  text;
+  i      integer := 0;
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  if p_days is not null and p_days &lt;= 0 then
+    raise exception &#x27;days must be positive&#x27; using errcode = &#x27;22023&#x27;;
+  end if;
+
+  v_key := replace(gen_random_uuid()::text, &#x27;-&#x27;, &#x27;&#x27;) || replace(gen_random_uuid()::text, &#x27;-&#x27;, &#x27;&#x27;);
+
+  if p_slug is null or btrim(p_slug) = &#x27;&#x27; then
+    loop
+      v_slug := substr(replace(gen_random_uuid()::text, &#x27;-&#x27;, &#x27;&#x27;), 1, 8);
+      exit when not exists (select 1 from public.cards c where c.slug = v_slug);
+      i := i + 1;
+      if i &gt; 20 then
+        raise exception &#x27;could not generate a slug&#x27; using errcode = &#x27;22023&#x27;;
+      end if;
+    end loop;
+  else
+    v_slug := lower(btrim(p_slug));
+    if v_slug !~ &#x27;^[a-z0-9][a-z0-9-]{2,29}$&#x27; then
+      raise exception &#x27;bad slug (3-30 chars: a-z 0-9 -)&#x27; using errcode = &#x27;22023&#x27;;
+    end if;
+    if exists (select 1 from public.cards c where c.slug = v_slug) then
+      raise exception &#x27;slug already taken&#x27; using errcode = &#x27;23505&#x27;;
+    end if;
+  end if;
+
+  insert into public.cards (slug, key_hash, label, active, expires_at)
+  values (
+    v_slug,
+    public._hash_key(v_key),
+    coalesce(p_label, &#x27;&#x27;),
+    false,
+    case when p_days is null then null else now() + make_interval(days =&gt; p_days) end
+  );
+
+  return jsonb_build_object(&#x27;slug&#x27;, v_slug, &#x27;key&#x27;, v_key);
+end;
+$$;
+
+create or replace function public.admin_list()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  return coalesce((
+    select jsonb_agg(
+             jsonb_build_object(
+               &#x27;slug&#x27;, c.slug,
+               &#x27;label&#x27;, c.label,
+               &#x27;name&#x27;, c.data-&gt;&#x27;v&#x27;-&gt;&gt;0,
+               &#x27;active&#x27;, c.active,
+               &#x27;expires_at&#x27;, c.expires_at,
+               &#x27;views&#x27;, c.views,
+               &#x27;created_at&#x27;, c.created_at,
+               &#x27;updated_at&#x27;, c.updated_at
+             )
+             order by c.created_at desc
+           )
+    from public.cards c
+  ), &#x27;[]&#x27;::jsonb);
+end;
+$$;
+
+-- p_days extends the expiry (from now if expired / unset, otherwise from the current expiry)
+create or replace function public.admin_update(
+  p_slug text,
+  p_active boolean default null,
+  p_days integer default null,
+  p_clear_expiry boolean default false,
+  p_label text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  n integer;
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  update public.cards c
+     set active = coalesce(p_active, c.active),
+         label = coalesce(p_label, c.label),
+         expires_at = case
+           when p_clear_expiry then null
+           when p_days is not null then greatest(now(), coalesce(c.expires_at, now())) + make_interval(days =&gt; p_days)
+           else c.expires_at
+         end
+   where c.slug = lower(btrim(p_slug));
+  get diagnostics n = row_count;
+  return n = 1;
+end;
+$$;
+
+create or replace function public.admin_reset_key(p_slug text)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_key text;
+  n integer;
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  v_key := replace(gen_random_uuid()::text, &#x27;-&#x27;, &#x27;&#x27;) || replace(gen_random_uuid()::text, &#x27;-&#x27;, &#x27;&#x27;);
+  update public.cards c set key_hash = public._hash_key(v_key) where c.slug = lower(btrim(p_slug));
+  get diagnostics n = row_count;
+  if n &lt;&gt; 1 then
+    raise exception &#x27;card not found&#x27; using errcode = &#x27;P0002&#x27;;
+  end if;
+  return v_key;
+end;
+$$;
+
+create or replace function public.admin_delete(p_slug text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  n integer;
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  delete from public.cards c where c.slug = lower(btrim(p_slug));
+  get diagnostics n = row_count;
+  return n = 1;
+end;
+$$;
+
+create or replace function public.admin_view(p_slug text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  d jsonb;
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  select c.data into d from public.cards c where c.slug = lower(btrim(p_slug));
+  return d;
+end;
+$$;
+
+create or replace function public.admin_export()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_admin() then
+    raise exception &#x27;not admin&#x27; using errcode = &#x27;42501&#x27;;
+  end if;
+  return coalesce((select jsonb_agg(to_jsonb(c) order by c.created_at) from public.cards c), &#x27;[]&#x27;::jsonb);
+end;
+$$;
+
+-- ---------------------------------------------------------------- permissions
+revoke execute on function public._hash_key(text) from public, anon, authenticated;
+
+revoke execute on function public.get_card(text)        from public, anon, authenticated;
+revoke execute on function public.edit_load(text)       from public, anon, authenticated;
+revoke execute on function public.edit_save(text, jsonb) from public, anon, authenticated;
+revoke execute on function public.is_admin()            from public, anon, authenticated;
+revoke execute on function public.admin_create(text, text, integer) from public, anon, authenticated;
+revoke execute on function public.admin_list()          from public, anon, authenticated;
+revoke execute on function public.admin_update(text, boolean, integer, boolean, text) from public, anon, authenticated;
+revoke execute on function public.admin_reset_key(text) from public, anon, authenticated;
+revoke execute on function public.admin_delete(text)    from public, anon, authenticated;
+revoke execute on function public.admin_view(text)      from public, anon, authenticated;
+revoke execute on function public.admin_export()        from public, anon, authenticated;
+
+grant execute on function public.get_card(text)         to anon, authenticated;
+grant execute on function public.edit_load(text)        to anon, authenticated;
+grant execute on function public.edit_save(text, jsonb) to anon, authenticated;
+
+grant execute on function public.is_admin()             to authenticated;
+grant execute on function public.admin_create(text, text, integer) to authenticated;
+grant execute on function public.admin_list()           to authenticated;
+grant execute on function public.admin_update(text, boolean, integer, boolean, text) to authenticated;
+grant execute on function public.admin_reset_key(text)  to authenticated;
+grant execute on function public.admin_delete(text)     to authenticated;
+grant execute on function public.admin_view(text)       to authenticated;
+grant execute on function public.admin_export()         to authenticated;
+</textarea><button id="ba">کپی setup.sql</button>
+<h2>۲) معرفی خودت به‌عنوان مدیر (make_admin.sql)</h2>
+<p>اول ایمیل خودت را بعد از Paste جایگزین <b dir="ltr">YOUR-EMAIL@example.com</b> کن، بعد Run بزن.</p>
+<textarea id="b" readonly>-- Run AFTER you created your admin user in Authentication -&gt; Users.
+-- Replace the email below with YOUR admin email, then Run.
+insert into public.admins (user_id)
+select id from auth.users where email = &#x27;YOUR-EMAIL@example.com&#x27;
+on conflict do nothing;
+
+-- must return exactly 1 row:
+select a.user_id, u.email from public.admins a join auth.users u on u.id = a.user_id;
+</textarea><button id="bb">کپی make_admin.sql</button>
+<script>
+function cp(id, btn) {
+  var t = document.getElementById(id), done = function () { btn.textContent = 'کپی شد ✓'; btn.className = 'ok'; };
+  t.focus(); t.select(); t.setSelectionRange(0, t.value.length);
+  var legacy = function () { try { if (document.execCommand('copy')) { done(); return; } } catch (e) {} btn.textContent = 'متن انتخاب شد؛ دستی کپی کن'; };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t.value).then(done, legacy); else legacy();
+}
+document.getElementById('ba').onclick = function () { cp('a', this); };
+document.getElementById('bb').onclick = function () { cp('b', this); };
+</script></body></html>
